@@ -1,0 +1,30 @@
+services:
+  scale-set-runner-default:
+    image: registry.ft-soft.ru/devops/scale_set_runners:v1
+    container_name: vneocheredi-runner-default
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      --url="https://github.com/VneOcheredi/vneocheredi-ru.devops-tests-replica"
+      --name="vneocheredi_runner_default_v1"
+      --token="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"
+      --labels="vneocheredi_runner_default"
+      --min-runners=1
+      --max-runners=3
+      --log-level=info
+  scale-set-runner-backend:
+    image: registry.ft-soft.ru/devops/scale_set_runners:v1
+    container_name: vneocheredi-runner-backend
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      --runner-image="registry.ft-soft.ru/devops/runner_vneocheredi_backend:latest"
+      --url="https://github.com/VneOcheredi/vneocheredi-ru.devops-tests-replica"
+      --name="vneocheredi_runner_backend_v1"
+      --token="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"
+      --labels="vneocheredi_runner_backend"
+      --min-runners=1
+      --max-runners=3
+      --log-level=info
