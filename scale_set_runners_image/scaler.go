@@ -5,21 +5,25 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
 )
 
 type Scaler struct {
-	countRunnersUp int
-	justStarted    bool
-	runners        runnerState
-	runnerImage    string
-	scaleSetID     int
-	dockerClient   *dockerclient.Client
+	countRunnersUp    int
+	justStarted       bool
+	runners           runnerState
+	runnerImage       string
+	dindImage         string
+	sharedNetworkName string
+	scaleSetID        int
+	dockerClient       *dockerclient.Client
 	scalesetClient *scaleset.Client
 	minRunners     int
 	maxRunners     int
@@ -61,34 +65,6 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 	return a.runners.count(), nil
 }
 
-// func (a *Scaler) selectImageForJob(jobInfo *scaleset.JobStarted) string {
-// 	if jobInfo == nil || len(jobInfo.JobMessageBase.RequestLabels) == 0 {
-// 		return a.runnerImage
-// 	}
-
-// 	for _, label := range jobInfo.JobMessageBase.RequestLabels {
-// 		switch label {
-// 		case "vneocheredi_runner_front":
-// 			if a.runnerImageFront != "" {
-// 				a.logger.Debug("Selected front image for job", "image", a.runnerImageFront)
-// 				return a.runnerImageFront
-// 			}
-// 		case "vneocheredi_runner_backend":
-// 			if a.runnerImageBackend != "" {
-// 				a.logger.Debug("Selected backend image for job", "image", a.runnerImageBackend)
-// 				return a.runnerImageBackend
-// 			}
-// 		case "vneocheredi_runner_default":
-// 			if a.runnerImage != "" {
-// 				a.logger.Debug("Selected default image for job", "image", a.runnerImage)
-// 				return a.runnerImage
-// 			}
-// 		}
-// 	}
-
-// 	return a.runnerImage
-// }
-
 func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
 	a.logger.Info(
 		"Job started",
@@ -102,18 +78,62 @@ func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
-	containerID := a.runners.markDone(jobInfo.RunnerName)
-	if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+	info := a.runners.markDone(jobInfo.RunnerName)
+	if err := a.dockerClient.ContainerRemove(ctx, info.runnerID, container.RemoveOptions{Force: true}); err != nil {
 		return fmt.Errorf("failed to remove runner container: %w", err)
 	}
+	if err := a.dockerClient.ContainerRemove(ctx, info.dindID, container.RemoveOptions{Force: true}); err != nil {
+		return fmt.Errorf("failed to remove dind container: %w", err)
+	}
+	if err := a.dockerClient.VolumeRemove(ctx, info.workspaceVol, false); err != nil {
+		a.logger.Error("Failed to remove workspace volume", slog.String("volume", info.workspaceVol), slog.String("error", err.Error()))
+	}
+	// Network is shared, removed on shutdown
 
 	return nil
 }
 
 func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	name := fmt.Sprintf("runner-%s", uuid.NewString()[:8])
+	dindName := fmt.Sprintf("dind-%s", name)
+	workspaceVolName := fmt.Sprintf("workspace-%s", name)
 
 	a.logger.Info("Starting runner with image", "image", a.runnerImage)
+
+	// Create shared workspace volume (runner checkout writes here; dind mounts it so container actions see files)
+	vol, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: workspaceVolName})
+	if err != nil {
+		return "", fmt.Errorf("failed to create workspace volume: %w", err)
+	}
+
+	// Create dind
+	dindC, err := a.dockerClient.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: a.dindImage,
+			Env:   []string{"DOCKER_TLS_CERTDIR="},
+		},
+		&container.HostConfig{
+			Privileged:  true,
+			NetworkMode: container.NetworkMode(a.sharedNetworkName),
+			Binds:       []string{vol.Name + ":/home/runner/_work"},
+		},
+		nil, nil,
+		dindName,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to create dind container: %w", err)
+	}
+
+	// Start dind
+	if err := a.dockerClient.ContainerStart(ctx, dindC.ID, container.StartOptions{}); err != nil {
+		return "", fmt.Errorf("failed to start dind container: %w", err)
+	}
+
+	// Wait for dind
+	time.Sleep(8 * time.Second)
+
+	dockerHost := fmt.Sprintf("tcp://%s:2375", dindName)
 
 	jit, err := a.scalesetClient.GenerateJitRunnerConfig(
 		ctx,
@@ -129,22 +149,19 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	c, err := a.dockerClient.ContainerCreate(
 		ctx,
 		&container.Config{
-			Image: a.runnerImage,
-			User:  "runner",
-			Cmd:   []string{"/home/runner/run.sh"},
+			Image:      a.runnerImage,
+			Entrypoint: []string{"/home/runner/run.sh"},
 			Env: []string{
 				fmt.Sprintf("ACTIONS_RUNNER_INPUT_JITCONFIG=%s", jit.EncodedJITConfig),
+				fmt.Sprintf("DOCKER_HOST=%s", dockerHost),
 			},
 		},
 		&container.HostConfig{
+			NetworkMode: container.NetworkMode(a.sharedNetworkName),
 			Binds: []string{
-				"/var/run/docker.sock:/var/run/docker.sock",
+				vol.Name + ":/home/runner/_work",
 				"/opt/build-cache:/opt/build-cache/",
 				"/opt/build-cache-npm:/opt/build-cache-npm/",
-				// "/home/runner/repo/:/home/runner/repo/",
-				// "/opt/build-cache:/home/runner/.nuget/packages",
-				// "/usr/bin/node:/__e/node20/bin/node",
-				// "/usr/bin/npm:/__e/node20/bin/npm",
 			},
 		},
 		nil, nil,
@@ -158,7 +175,11 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to start runner container: %w", err)
 	}
 
-	a.runners.addIdle(name, c.ID)
+	a.runners.addIdle(name, runnerInfo{
+		runnerID:     c.ID,
+		dindID:       dindC.ID,
+		workspaceVol: vol.Name,
+	})
 	return name, nil
 }
 
@@ -167,29 +188,42 @@ func (a *Scaler) shutdown(ctx context.Context) {
 	a.runners.mu.Lock()
 	defer a.runners.mu.Unlock()
 
-	for name, containerID := range a.runners.idle {
-		a.logger.Info("Removing idle runner", slog.String("name", name), slog.String("containerID", containerID))
-		if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
-			a.logger.Error("Failed to remove idle runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
+	removeRunner := func(name string, info runnerInfo) {
+		a.logger.Info("Removing runner", slog.String("name", name), slog.String("runnerID", info.runnerID))
+		if err := a.dockerClient.ContainerRemove(ctx, info.runnerID, container.RemoveOptions{Force: true}); err != nil {
+			a.logger.Error("Failed to remove runner container", slog.String("name", name), slog.String("error", err.Error()))
 		}
+		if err := a.dockerClient.ContainerRemove(ctx, info.dindID, container.RemoveOptions{Force: true}); err != nil {
+			a.logger.Error("Failed to remove dind container", slog.String("name", name), slog.String("error", err.Error()))
+		}
+		if err := a.dockerClient.VolumeRemove(ctx, info.workspaceVol, false); err != nil {
+			a.logger.Error("Failed to remove workspace volume", slog.String("name", name), slog.String("error", err.Error()))
+		}
+	}
+
+	for name, info := range a.runners.idle {
+		removeRunner(name, info)
 	}
 	clear(a.runners.idle)
 
-	for name, containerID := range a.runners.busy {
-		a.logger.Info("Removing busy runner", slog.String("name", name), slog.String("containerID", containerID))
-		if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
-			a.logger.Error("Failed to remove busy runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
-		}
+	for name, info := range a.runners.busy {
+		removeRunner(name, info)
 	}
 	clear(a.runners.busy)
 }
 
 var _ listener.Scaler = (*Scaler)(nil)
 
+type runnerInfo struct {
+	runnerID     string
+	dindID       string
+	workspaceVol string
+}
+
 type runnerState struct {
 	mu   sync.Mutex
-	idle map[string]string
-	busy map[string]string
+	idle map[string]runnerInfo
+	busy map[string]runnerInfo
 }
 
 func (r *runnerState) count() int {
@@ -202,36 +236,36 @@ func (r *runnerState) count() int {
 func (r *runnerState) markBusy(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state, ok := r.idle[name]
+	info, ok := r.idle[name]
 	if !ok {
 		panic("marking non-existent runner busy")
 	}
 	delete(r.idle, name)
-	r.busy[name] = state
+	r.busy[name] = info
 }
 
-func (r *runnerState) markDone(name string) string {
+func (r *runnerState) markDone(name string) runnerInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.markDoneUnlocked(name)
 }
 
-func (r *runnerState) markDoneUnlocked(name string) string {
-	containerID, ok := r.busy[name]
+func (r *runnerState) markDoneUnlocked(name string) runnerInfo {
+	info, ok := r.busy[name]
 	if ok {
 		delete(r.busy, name)
-		return containerID
+		return info
 	}
-	containerID, ok = r.idle[name]
+	info, ok = r.idle[name]
 	if ok {
 		delete(r.idle, name)
-		return containerID
+		return info
 	}
 	panic("marking non-existent runner done")
 }
 
-func (r *runnerState) addIdle(name, containerID string) {
+func (r *runnerState) addIdle(name string, info runnerInfo) {
 	r.mu.Lock()
-	r.idle[name] = containerID
+	r.idle[name] = info
 	r.mu.Unlock()
 }

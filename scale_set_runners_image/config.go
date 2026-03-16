@@ -20,8 +20,9 @@ type Config struct {
 	GitHubApp       scaleset.GitHubAppAuth
 	Token           string
 	RunnerImage     string
+	DindImage       string
 	LogLevel        string
-	LogFormat       string
+	LogFormat         string
 }
 
 func (c *Config) defaults() {
@@ -30,6 +31,9 @@ func (c *Config) defaults() {
 	}
 	if c.RunnerImage == "" {
 		c.RunnerImage = "ghcr.io/actions/actions-runner:latest"
+	}
+	if c.DindImage == "" {
+		c.DindImage = "docker:dind"
 	}
 }
 
