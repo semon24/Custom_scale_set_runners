@@ -110,8 +110,10 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	dindC, err := a.dockerClient.ContainerCreate(
 		ctx,
 		&container.Config{
-			Image: a.dindImage,
-			Env:   []string{"DOCKER_TLS_CERTDIR="},
+			Image:      a.dindImage,
+			Entrypoint: []string{"sh", "-lc"},
+			Cmd:        []string{"mkdir -p /home/runner/_work && chmod -R 777 /home/runner/_work && exec dockerd-entrypoint.sh"},
+			Env:        []string{"DOCKER_TLS_CERTDIR="},
 		},
 		&container.HostConfig{
 			Privileged:  true,
@@ -150,7 +152,8 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		ctx,
 		&container.Config{
 			Image:      a.runnerImage,
-			Entrypoint: []string{"/home/runner/run.sh"},
+			Entrypoint: []string{"sh", "-lc"},
+			Cmd:        []string{"mkdir -p /home/runner/_work && chmod -R 777 /home/runner/_work && exec /home/runner/run.sh"},
 			Env: []string{
 				fmt.Sprintf("ACTIONS_RUNNER_INPUT_JITCONFIG=%s", jit.EncodedJITConfig),
 				fmt.Sprintf("DOCKER_HOST=%s", dockerHost),
