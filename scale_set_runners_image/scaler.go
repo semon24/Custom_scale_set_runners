@@ -126,6 +126,13 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 			Cmd: []string{
 				fmt.Sprintf("mkdir -p /home/runner/_work && chown -R %s:%s /home/runner/_work && exec dockerd-entrypoint.sh", runnerUID, runnerUID),
 			},
+			Healthcheck: &container.HealthConfig{
+				Test:        []string{"CMD-SHELL", "docker info >/dev/null 2>&1"},
+				Interval:    2 * time.Second,
+				Timeout:     2 * time.Second,
+				Retries:     15,
+				StartPeriod: 5 * time.Second,
+			},
 		},
 		&container.HostConfig{
 			Privileged:  true,
@@ -199,46 +206,95 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 }
 
 func (a *Scaler) waitForDindReady(ctx context.Context, dindContainerID string, timeout time.Duration) error {
+	// Previous readiness approach kept for reference (do not remove):
+	//
+	// deadline := time.Now().Add(timeout)
+	// var lastErr error
+	//
+	// for time.Now().Before(deadline) {
+	// 	execResp, err := a.dockerClient.ContainerExecCreate(ctx, dindContainerID, container.ExecOptions{
+	// 		Cmd:          []string{"sh", "-lc", "docker info >/dev/null 2>&1"},
+	// 		AttachStdout: false,
+	// 		AttachStderr: false,
+	// 	})
+	// 	if err != nil {
+	// 		lastErr = err
+	// 		time.Sleep(1 * time.Second)
+	// 		continue
+	// 	}
+	//
+	// 	if err := a.dockerClient.ContainerExecStart(ctx, execResp.ID, container.ExecStartOptions{}); err != nil {
+	// 		lastErr = err
+	// 		time.Sleep(1 * time.Second)
+	// 		continue
+	// 	}
+	//
+	// 	for {
+	// 		inspect, err := a.dockerClient.ContainerExecInspect(ctx, execResp.ID)
+	// 		if err != nil {
+	// 			lastErr = err
+	// 			break
+	// 		}
+	//
+	// 		if inspect.Running {
+	// 			time.Sleep(200 * time.Millisecond)
+	// 			continue
+	// 		}
+	//
+	// 		if inspect.ExitCode == 0 {
+	// 			a.logger.Info("dind is ready", slog.String("containerID", dindContainerID))
+	// 			return nil
+	// 		}
+	//
+	// 		lastErr = fmt.Errorf("readiness probe exit code %d", inspect.ExitCode)
+	// 		break
+	// 	}
+	//
+	// 	time.Sleep(1 * time.Second)
+	// }
+	//
+	// if lastErr == nil {
+	// 	lastErr = fmt.Errorf("timeout exceeded")
+	// }
+	// return lastErr
+
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 
 	for time.Now().Before(deadline) {
-		execResp, err := a.dockerClient.ContainerExecCreate(ctx, dindContainerID, container.ExecOptions{
-			Cmd:          []string{"sh", "-lc", "docker info >/dev/null 2>&1"},
-			AttachStdout: false,
-			AttachStderr: false,
-		})
+		inspect, err := a.dockerClient.ContainerInspect(ctx, dindContainerID)
 		if err != nil {
 			lastErr = err
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		if err := a.dockerClient.ContainerExecStart(ctx, execResp.ID, container.ExecStartOptions{}); err != nil {
-			lastErr = err
+		if inspect.State == nil {
+			lastErr = fmt.Errorf("dind state is nil")
 			time.Sleep(1 * time.Second)
 			continue
 		}
 
-		for {
-			inspect, err := a.dockerClient.ContainerExecInspect(ctx, execResp.ID)
-			if err != nil {
-				lastErr = err
-				break
-			}
+		if !inspect.State.Running {
+			lastErr = fmt.Errorf("dind is not running (status=%s)", inspect.State.Status)
+			time.Sleep(1 * time.Second)
+			continue
+		}
 
-			if inspect.Running {
-				time.Sleep(200 * time.Millisecond)
-				continue
-			}
+		if inspect.State.Health == nil {
+			lastErr = fmt.Errorf("dind has no health status yet")
+			time.Sleep(1 * time.Second)
+			continue
+		}
 
-			if inspect.ExitCode == 0 {
-				a.logger.Info("dind is ready", slog.String("containerID", dindContainerID))
-				return nil
-			}
-
-			lastErr = fmt.Errorf("readiness probe exit code %d", inspect.ExitCode)
-			break
+		switch inspect.State.Health.Status {
+		case "healthy":
+			a.logger.Info("dind is ready", slog.String("containerID", dindContainerID), slog.String("health", inspect.State.Health.Status))
+			return nil
+		case "unhealthy":
+			lastErr = fmt.Errorf("dind healthcheck is unhealthy")
+		default:
+			lastErr = fmt.Errorf("dind healthcheck status is %s", inspect.State.Health.Status)
 		}
 
 		time.Sleep(1 * time.Second)
