@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -20,6 +21,8 @@ import (
 const runnerUID = "1001"
 
 const volumeJanitorInterval = 3 * time.Minute
+const volumeJanitorMinAge = 10 * time.Minute
+const runnerReadyTimeout = 90 * time.Second
 
 type Scaler struct {
 	countRunnersUp    int
@@ -57,12 +60,35 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			slog.Int("scaleUp", scaleUp),
 		)
 
-		for range scaleUp {
-			if _, err := a.startRunner(ctx); err != nil {
-				return 0, fmt.Errorf("failed to start runner: %w", err)
-			}
+
+		errCh := make(chan error, scaleUp)
+		var wg sync.WaitGroup
+
+		for i := 0; i < scaleUp; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := a.startRunner(ctx); err != nil {
+					errCh <- err
+				}
+			}()
 		}
 
+		wg.Wait()
+		close(errCh)
+
+		var failed int
+		var firstErr error
+		for err := range errCh {
+			if failed == 0 {
+				firstErr = err
+			}
+			failed++
+		}
+
+		if failed > 0 {
+			return a.runners.count(), fmt.Errorf("failed to start %d of %d runners: %w", failed, scaleUp, firstErr)
+		}
 		return a.runners.count(), nil
 	default:
 		// No need to handle scale down events, since:
@@ -81,8 +107,6 @@ func (a *Scaler) startVolumeJanitor(ctx context.Context) {
 			ticker := time.NewTicker(volumeJanitorInterval)
 			defer ticker.Stop()
 
-			a.cleanupDanglingVolumes()
-
 			for {
 				select {
 				case <-ctx.Done():
@@ -99,6 +123,7 @@ func (a *Scaler) startVolumeJanitor(ctx context.Context) {
 func (a *Scaler) cleanupDanglingVolumes() {
 	runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	trackedWorkspaceVolumes := a.trackedWorkspaceVolumes()
 
 	list, err := a.dockerClient.VolumeList(runCtx, volume.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("dangling", "true")),
@@ -114,6 +139,14 @@ func (a *Scaler) cleanupDanglingVolumes() {
 			continue
 		}
 
+		if _, tracked := trackedWorkspaceVolumes[v.Name]; tracked {
+			continue
+		}
+
+		if !isVolumeOldEnough(v.CreatedAt, volumeJanitorMinAge) {
+			continue
+		}
+
 		if err := a.dockerClient.VolumeRemove(runCtx, v.Name, true); err != nil {
 			a.logger.Warn("Failed to remove dangling volume", slog.String("volume", v.Name), slog.String("error", err.Error()))
 			continue
@@ -126,6 +159,27 @@ func (a *Scaler) cleanupDanglingVolumes() {
 	if removed > 0 {
 		a.logger.Info("Volume janitor run completed", slog.Int("removed", removed))
 	}
+}
+
+func (a *Scaler) trackedWorkspaceVolumes() map[string]struct{} {
+	volumes := make(map[string]struct{})
+
+	a.runners.mu.Lock()
+	defer a.runners.mu.Unlock()
+
+	for _, info := range a.runners.idle {
+		if info.workspaceVol != "" {
+			volumes[info.workspaceVol] = struct{}{}
+		}
+	}
+
+	for _, info := range a.runners.busy {
+		if info.workspaceVol != "" {
+			volumes[info.workspaceVol] = struct{}{}
+		}
+	}
+
+	return volumes
 }
 
 func isJanitorCandidateVolume(name string) bool {
@@ -151,6 +205,22 @@ func isLikelyAnonymousVolumeName(name string) bool {
 	}
 
 	return true
+}
+
+func isVolumeOldEnough(createdAt string, minAge time.Duration) bool {
+	if createdAt == "" {
+		return true
+	}
+
+	parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, createdAt)
+		if err != nil {
+			return true
+		}
+	}
+
+	return time.Since(parsed) >= minAge
 }
 
 func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
@@ -254,6 +324,13 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		&container.Config{
 			Image:      a.runnerImage,
 			Entrypoint: []string{"/home/runner/run.sh"},
+			Healthcheck: &container.HealthConfig{
+				Test:        []string{"CMD-SHELL", "pgrep -f Runner.Listener >/dev/null 2>&1"},
+				Interval:    5 * time.Second,
+				Timeout:     2 * time.Second,
+				Retries:     12,
+				StartPeriod: 20 * time.Second,
+			},
 			Env: []string{
 				fmt.Sprintf("ACTIONS_RUNNER_INPUT_JITCONFIG=%s", jit.EncodedJITConfig),
 				fmt.Sprintf("DOCKER_HOST=%s", dockerHost),
@@ -278,12 +355,102 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to start runner container: %w", err)
 	}
 
+	if err := a.waitForRunnerReady(ctx, c.ID, name, runnerReadyTimeout); err != nil {
+		return "", fmt.Errorf("runner did not become ready: %w", err)
+	}
+
 	a.runners.addIdle(name, runnerInfo{
 		runnerID:     c.ID,
 		dindID:       dindC.ID,
 		workspaceVol: vol.Name,
 	})
 	return name, nil
+}
+
+func (a *Scaler) waitForRunnerReady(ctx context.Context, runnerContainerID, runnerName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		inspect, err := a.dockerClient.ContainerInspect(ctx, runnerContainerID)
+		if err != nil {
+			lastErr = err
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if inspect.State == nil {
+			lastErr = fmt.Errorf("runner state is nil")
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if !inspect.State.Running {
+			lastErr = fmt.Errorf("runner is not running (status=%s)", inspect.State.Status)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		healthReady := false
+		if inspect.State.Health == nil {
+			lastErr = fmt.Errorf("runner has no health status yet")
+		} else if inspect.State.Health.Status != "healthy" {
+			lastErr = fmt.Errorf("runner healthcheck status is %s", inspect.State.Health.Status)
+		} else {
+			healthReady = true
+		}
+
+		listening, err := a.runnerIsListeningForJobs(ctx, runnerContainerID)
+		if err != nil {
+			lastErr = err
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		if healthReady && listening {
+			a.logger.Info("Runner is fully ready and waiting for jobs", slog.String("runner", runnerName), slog.String("containerID", runnerContainerID))
+			return nil
+		}
+
+		if !listening {
+			lastErr = fmt.Errorf("runner has not reached 'Listening for Jobs' state yet")
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timeout exceeded")
+	}
+	return lastErr
+}
+
+func (a *Scaler) runnerIsListeningForJobs(ctx context.Context, runnerContainerID string) (bool, error) {
+	logsReader, err := a.dockerClient.ContainerLogs(ctx, runnerContainerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "200",
+	})
+	if err != nil {
+		return false, err
+	}
+	defer logsReader.Close()
+
+	logBytes, err := io.ReadAll(logsReader)
+	if err != nil {
+		return false, err
+	}
+
+	logsText := string(logBytes)
+	if strings.Contains(logsText, "Listening for Jobs") || strings.Contains(logsText, "Listening for jobs") {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (a *Scaler) waitForDindReady(ctx context.Context, dindContainerID string, timeout time.Duration) error {
