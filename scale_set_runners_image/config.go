@@ -18,6 +18,7 @@ type Config struct {
 	Labels          []string
 	RunnerGroup     string
 	GitHubApp       scaleset.GitHubAppAuth
+	GitHubAppPrivateKeyFile string
 	Token           string
 	RunnerImage     string
 	DindImage       string
@@ -39,6 +40,14 @@ func (c *Config) defaults() {
 
 func (c *Config) Validate() error {
 	c.defaults()
+
+	if c.GitHubApp.PrivateKey == "" && c.GitHubAppPrivateKeyFile != "" {
+		privateKeyBytes, err := os.ReadFile(c.GitHubAppPrivateKeyFile)
+		if err != nil {
+			return fmt.Errorf("failed to read GitHub App private key file %q: %w", c.GitHubAppPrivateKeyFile, err)
+		}
+		c.GitHubApp.PrivateKey = strings.TrimSpace(string(privateKeyBytes))
+	}
 
 	if _, err := url.ParseRequestURI(c.RegistrationURL); err != nil {
 		return fmt.Errorf("invalid registration URL: %w, it should be the full URL of where you want to register your scale set, e.g. 'https://github.com/org/repo'", err)

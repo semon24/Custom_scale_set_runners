@@ -30,6 +30,7 @@ func init() {
 	flags.StringVar(&cfg.GitHubApp.ClientID, "app-client-id", "", "GitHub App client id")
 	flags.Int64Var(&cfg.GitHubApp.InstallationID, "app-installation-id", 0, "GitHub App installation ID")
 	flags.StringVar(&cfg.GitHubApp.PrivateKey, "app-private-key", "", "GitHub App private key")
+	flags.StringVar(&cfg.GitHubAppPrivateKeyFile, "app-private-key-file", "", "Path to GitHub App private key PEM file")
 	flags.StringVar(&cfg.Token, "token", "", "Personal access token (can be used in place of a GitHub App, although not recommended)")
 	flags.StringVar(&cfg.LogLevel, "log-level", "info", "Logging level (debug, info, warn, error)")
 	flags.StringVar(&cfg.LogFormat, "log-format", "text", "Logging format (text, json). If invalid value is provided, defaults to no logs.")
