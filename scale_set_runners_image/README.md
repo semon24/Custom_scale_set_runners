@@ -53,3 +53,11 @@ You'll then need:
 | `--runner-image` | No | Override container image (defaults to latest official). |
 
 *Provide either App credentials (all three) OR a PAT.*
+
+## Optional: Preloaded dind image
+
+If startup is slow because each fresh dind pulls the runner image, use the preloaded dind variant in this folder:
+
+- [dind_preloaded/README.md](dind_preloaded/README.md)
+
+This variant takes the runner image from host Docker cache during image build (`docker save`) and preloads it into dind daemon on container startup (`docker load`).
