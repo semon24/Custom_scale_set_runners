@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
@@ -17,10 +19,13 @@ import (
 
 const runnerUID = "1001"
 
+const volumeJanitorInterval = 3 * time.Minute
+
 type Scaler struct {
 	countRunnersUp    int
 	justStarted       bool
 	runners           runnerState
+	janitorOnce       sync.Once
 	runnerImage       string
 	dindImage         string
 	sharedNetworkName string
@@ -33,6 +38,8 @@ type Scaler struct {
 }
 
 func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+	a.startVolumeJanitor(ctx)
+
 	currentCount := a.runners.count()
 	targetRunnerCount := min(a.maxRunners, a.minRunners+count)
 
@@ -65,6 +72,85 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		// 4. If the job is cancelled, the JobCompleted event will still be delivered.
 	}
 	return a.runners.count(), nil
+}
+
+func (a *Scaler) startVolumeJanitor(ctx context.Context) {
+	a.janitorOnce.Do(func() {
+		a.logger.Info("Starting volume janitor", slog.Duration("interval", volumeJanitorInterval))
+		go func() {
+			ticker := time.NewTicker(volumeJanitorInterval)
+			defer ticker.Stop()
+
+			a.cleanupDanglingVolumes()
+
+			for {
+				select {
+				case <-ctx.Done():
+					a.logger.Info("Volume janitor stopped")
+					return
+				case <-ticker.C:
+					a.cleanupDanglingVolumes()
+				}
+			}
+		}()
+	})
+}
+
+func (a *Scaler) cleanupDanglingVolumes() {
+	runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	list, err := a.dockerClient.VolumeList(runCtx, volume.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("dangling", "true")),
+	})
+	if err != nil {
+		a.logger.Warn("Failed to list dangling volumes", slog.String("error", err.Error()))
+		return
+	}
+
+	removed := 0
+	for _, v := range list.Volumes {
+		if !isJanitorCandidateVolume(v.Name) {
+			continue
+		}
+
+		if err := a.dockerClient.VolumeRemove(runCtx, v.Name, true); err != nil {
+			a.logger.Warn("Failed to remove dangling volume", slog.String("volume", v.Name), slog.String("error", err.Error()))
+			continue
+		}
+
+		removed++
+		a.logger.Info("Removed dangling volume", slog.String("volume", v.Name))
+	}
+
+	if removed > 0 {
+		a.logger.Info("Volume janitor run completed", slog.Int("removed", removed))
+	}
+}
+
+func isJanitorCandidateVolume(name string) bool {
+	if strings.HasPrefix(name, "workspace-") {
+		return true
+	}
+
+	return isLikelyAnonymousVolumeName(name)
+}
+
+func isLikelyAnonymousVolumeName(name string) bool {
+	if len(name) != 64 {
+		return false
+	}
+
+	for _, ch := range name {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch >= 'a' && ch <= 'f':
+		default:
+			return false
+		}
+	}
+
+	return true
 }
 
 func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStarted) error {
@@ -110,11 +196,6 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to create workspace volume: %w", err)
 	}
 	a.logger.Info("Workspace volume created", slog.String("runner", name), slog.String("volume", vol.Name))
-
-	// init-container path is temporarily disabled; dind startup now performs chown on mounted workspace.
-	// if err := a.prepareWorkspaceVolume(ctx, vol.Name); err != nil {
-	// 	return "", fmt.Errorf("failed to prepare workspace volume: %w", err)
-	// }
 
 	// Create dind
 	dindC, err := a.dockerClient.ContainerCreate(
@@ -206,57 +287,6 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 }
 
 func (a *Scaler) waitForDindReady(ctx context.Context, dindContainerID string, timeout time.Duration) error {
-	// Previous readiness approach kept for reference (do not remove):
-	//
-	// deadline := time.Now().Add(timeout)
-	// var lastErr error
-	//
-	// for time.Now().Before(deadline) {
-	// 	execResp, err := a.dockerClient.ContainerExecCreate(ctx, dindContainerID, container.ExecOptions{
-	// 		Cmd:          []string{"sh", "-lc", "docker info >/dev/null 2>&1"},
-	// 		AttachStdout: false,
-	// 		AttachStderr: false,
-	// 	})
-	// 	if err != nil {
-	// 		lastErr = err
-	// 		time.Sleep(1 * time.Second)
-	// 		continue
-	// 	}
-	//
-	// 	if err := a.dockerClient.ContainerExecStart(ctx, execResp.ID, container.ExecStartOptions{}); err != nil {
-	// 		lastErr = err
-	// 		time.Sleep(1 * time.Second)
-	// 		continue
-	// 	}
-	//
-	// 	for {
-	// 		inspect, err := a.dockerClient.ContainerExecInspect(ctx, execResp.ID)
-	// 		if err != nil {
-	// 			lastErr = err
-	// 			break
-	// 		}
-	//
-	// 		if inspect.Running {
-	// 			time.Sleep(200 * time.Millisecond)
-	// 			continue
-	// 		}
-	//
-	// 		if inspect.ExitCode == 0 {
-	// 			a.logger.Info("dind is ready", slog.String("containerID", dindContainerID))
-	// 			return nil
-	// 		}
-	//
-	// 		lastErr = fmt.Errorf("readiness probe exit code %d", inspect.ExitCode)
-	// 		break
-	// 	}
-	//
-	// 	time.Sleep(1 * time.Second)
-	// }
-	//
-	// if lastErr == nil {
-	// 	lastErr = fmt.Errorf("timeout exceeded")
-	// }
-	// return lastErr
 
 	deadline := time.Now().Add(timeout)
 	var lastErr error
@@ -305,54 +335,6 @@ func (a *Scaler) waitForDindReady(ctx context.Context, dindContainerID string, t
 	}
 	return lastErr
 }
-
-// func (a *Scaler) prepareWorkspaceVolume(ctx context.Context, volumeName string) error {
-// 	initName := fmt.Sprintf("workspace-init-%s", uuid.NewString()[:8])
-//
-// 	initContainer, err := a.dockerClient.ContainerCreate(
-// 		ctx,
-// 		&container.Config{
-// 			Image:      a.dindImage,
-// 			Entrypoint: []string{"sh", "-lc"},
-// 			Cmd: []string{
-// 				fmt.Sprintf("mkdir -p /home/runner/_work && chown -R %s:%s /home/runner/_work", runnerUID, runnerUID),
-// 			},
-// 		},
-// 		&container.HostConfig{
-// 			Binds: []string{volumeName + ":/home/runner/_work"},
-// 		},
-// 		nil,
-// 		nil,
-// 		initName,
-// 	)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to create workspace init container: %w", err)
-// 	}
-//
-// 	defer func() {
-// 		if removeErr := a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), initContainer.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); removeErr != nil {
-// 			a.logger.Warn("Failed to remove workspace init container", slog.String("id", initContainer.ID), slog.String("error", removeErr.Error()))
-// 		}
-// 	}()
-//
-// 	if err := a.dockerClient.ContainerStart(ctx, initContainer.ID, container.StartOptions{}); err != nil {
-// 		return fmt.Errorf("failed to start workspace init container: %w", err)
-// 	}
-//
-// 	statusCh, errCh := a.dockerClient.ContainerWait(ctx, initContainer.ID, container.WaitConditionNotRunning)
-// 	select {
-// 	case err := <-errCh:
-// 		if err != nil {
-// 			return fmt.Errorf("workspace init container wait failed: %w", err)
-// 		}
-// 	case status := <-statusCh:
-// 		if status.StatusCode != 0 {
-// 			return fmt.Errorf("workspace init container exited with status code %d", status.StatusCode)
-// 		}
-// 	}
-//
-// 	return nil
-// }
 
 func (a *Scaler) shutdown(ctx context.Context) {
 	a.logger.Info("Shutting down runners")
