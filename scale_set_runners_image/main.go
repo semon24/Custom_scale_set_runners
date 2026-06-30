@@ -8,12 +8,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -49,22 +47,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-}
-
-// ensureSharedNetwork creates the network or returns ID if it already exists (e.g. from previous crashed run).
-func ensureSharedNetwork(ctx context.Context, client *dockerclient.Client, name string) (string, error) {
-	netResp, err := client.NetworkCreate(ctx, name, network.CreateOptions{})
-	if err == nil {
-		return netResp.ID, nil
-	}
-	if strings.Contains(err.Error(), "already exists") {
-		net, err := client.NetworkInspect(ctx, name, network.InspectOptions{})
-		if err != nil {
-			return "", fmt.Errorf("network exists but inspect failed: %w", err)
-		}
-		return net.ID, nil
-	}
-	return "", err
 }
 
 func run(ctx context.Context, c Config) error {
@@ -172,18 +154,6 @@ func run(ctx context.Context, c Config) error {
 		return fmt.Errorf("failed to close dind image pull: %w", err)
 	}
 
-	// Create or reuse shared network for all runner-dind pairs (avoids "address pools exhausted" error)
-	sharedNetworkName := "runner-dind-network"
-	sharedNetworkID, err := ensureSharedNetwork(ctx, dockerClient, sharedNetworkName)
-	if err != nil {
-		return fmt.Errorf("failed to create shared network: %w", err)
-	}
-	defer func() {
-		if err := dockerClient.NetworkRemove(context.WithoutCancel(ctx), sharedNetworkID); err != nil {
-			logger.Error("Failed to remove shared network", slog.String("error", err.Error()))
-		}
-	}()
-
 	// Get the name of the client which will be used as the owner
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -209,17 +179,16 @@ func run(ctx context.Context, c Config) error {
 
 	scaler := &Scaler{
 		logger:             logger.WithGroup("scaler"),
-		runners:            runnerState{
+		runners: runnerState{
 			idle: make(map[string]runnerInfo),
 			busy: make(map[string]runnerInfo),
 		},
-		justStarted:        true,
-		runnerImage:        c.RunnerImage,
-		dindImage:          c.DindImage,
-		sharedNetworkName:  sharedNetworkName,
-		minRunners:         c.MinRunners,
-		maxRunners:         c.MaxRunners,
-		dockerClient:       dockerClient,
+		justStarted:    true,
+		runnerImage:    c.RunnerImage,
+		dindImage:      c.DindImage,
+		minRunners:     c.MinRunners,
+		maxRunners:     c.MaxRunners,
+		dockerClient:   dockerClient,
 		scalesetClient:     scalesetClient,
 		scaleSetID:         scaleSet.ID,
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
@@ -31,7 +32,6 @@ type Scaler struct {
 	janitorOnce       sync.Once
 	runnerImage       string
 	dindImage         string
-	sharedNetworkName string
 	scaleSetID        int
 	dockerClient       *dockerclient.Client
 	scalesetClient *scaleset.Client
@@ -237,34 +237,40 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
 	info := a.runners.markDone(jobInfo.RunnerName)
-	if err := a.dockerClient.ContainerRemove(ctx, info.runnerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
-		return fmt.Errorf("failed to remove runner container: %w", err)
-	}
-	if err := a.dockerClient.ContainerRemove(ctx, info.dindID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
-		return fmt.Errorf("failed to remove dind container: %w", err)
-	}
-	if err := a.dockerClient.VolumeRemove(ctx, info.workspaceVol, true); err != nil {
-		a.logger.Error("Failed to remove workspace volume", slog.String("volume", info.workspaceVol), slog.String("error", err.Error()))
-	} else {
-		a.logger.Info("Workspace volume removed", slog.String("runner", jobInfo.RunnerName), slog.String("volume", info.workspaceVol))
-	}
-	// Network is shared, removed on shutdown
-
-	return nil
+	return a.removeRunnerResources(ctx, jobInfo.RunnerName, info)
 }
 
 func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	name := fmt.Sprintf("runner-%s", uuid.NewString()[:8])
 	dindName := fmt.Sprintf("dind-%s", name)
+	networkName := fmt.Sprintf("runner-net-%s", name)
 	workspaceVolName := fmt.Sprintf("workspace-%s", name)
+	dockerHost := "tcp://docker:2375"
 
 	a.logger.Info("Starting runner with image", "image", a.runnerImage)
+
+	netResp, err := a.dockerClient.NetworkCreate(ctx, networkName, network.CreateOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to create pair network: %w", err)
+	}
+
+	cleanup := runnerInfo{networkID: netResp.ID, networkName: networkName}
+	cleanupNeeded := true
+	defer func() {
+		if !cleanupNeeded {
+			return
+		}
+		if err := a.removeRunnerResources(context.WithoutCancel(ctx), name, cleanup); err != nil {
+			a.logger.Error("Failed to rollback runner resources", slog.String("runner", name), slog.String("error", err.Error()))
+		}
+	}()
 
 	// Create shared workspace volume (runner checkout writes here; dind mounts it so container actions see files)
 	vol, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: workspaceVolName})
 	if err != nil {
 		return "", fmt.Errorf("failed to create workspace volume: %w", err)
 	}
+	cleanup.workspaceVol = vol.Name
 	a.logger.Info("Workspace volume created", slog.String("runner", name), slog.String("volume", vol.Name))
 
 	// Create dind
@@ -287,15 +293,23 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		},
 		&container.HostConfig{
 			Privileged:  true,
-			NetworkMode: container.NetworkMode(a.sharedNetworkName),
+			NetworkMode: container.NetworkMode(networkName),
 			Binds:       []string{vol.Name + ":/home/runner/_work"},
 		},
-		nil, nil,
+		&network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				networkName: {
+					Aliases: []string{"docker", dindName},
+				},
+			},
+		},
+		nil,
 		dindName,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to create dind container: %w", err)
 	}
+	cleanup.dindID = dindC.ID
 
 	// Start dind
 	if err := a.dockerClient.ContainerStart(ctx, dindC.ID, container.StartOptions{}); err != nil {
@@ -305,8 +319,6 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	if err := a.waitForDindReady(ctx, dindC.ID, 45*time.Second); err != nil {
 		return "", fmt.Errorf("dind did not become ready: %w", err)
 	}
-
-	dockerHost := fmt.Sprintf("tcp://%s:2375", dindName)
 
 	jit, err := a.scalesetClient.GenerateJitRunnerConfig(
 		ctx,
@@ -337,19 +349,25 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 			},
 		},
 		&container.HostConfig{
-			NetworkMode: container.NetworkMode(a.sharedNetworkName),
+			NetworkMode: container.NetworkMode(networkName),
 			Binds: []string{
 				vol.Name + ":/home/runner/_work",
 				"/opt/build-cache:/opt/build-cache/",
 				"/opt/build-cache-npm:/opt/build-cache-npm/",
 			},
 		},
-		nil, nil,
+		&network.NetworkingConfig{
+			EndpointsConfig: map[string]*network.EndpointSettings{
+				networkName: {},
+			},
+		},
+		nil,
 		name,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to create runner container: %w", err)
 	}
+	cleanup.runnerID = c.ID
 
 	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
 		return "", fmt.Errorf("failed to start runner container: %w", err)
@@ -362,9 +380,55 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	a.runners.addIdle(name, runnerInfo{
 		runnerID:     c.ID,
 		dindID:       dindC.ID,
+		networkID:    netResp.ID,
+		networkName:  networkName,
 		workspaceVol: vol.Name,
 	})
+	cleanupNeeded = false
 	return name, nil
+}
+
+func (a *Scaler) removeRunnerResources(ctx context.Context, runnerName string, info runnerInfo) error {
+	var errs []string
+
+	if info.runnerID != "" {
+		if err := a.dockerClient.ContainerRemove(ctx, info.runnerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
+			errs = append(errs, fmt.Sprintf("remove runner container: %v", err))
+		}
+	}
+
+	if info.dindID != "" {
+		if err := a.dockerClient.ContainerRemove(ctx, info.dindID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
+			errs = append(errs, fmt.Sprintf("remove dind container: %v", err))
+		}
+	}
+
+	if info.workspaceVol != "" {
+		if err := a.dockerClient.VolumeRemove(ctx, info.workspaceVol, true); err != nil {
+			a.logger.Error("Failed to remove workspace volume", slog.String("runner", runnerName), slog.String("volume", info.workspaceVol), slog.String("error", err.Error()))
+			errs = append(errs, fmt.Sprintf("remove workspace volume: %v", err))
+		} else {
+			a.logger.Info("Workspace volume removed", slog.String("runner", runnerName), slog.String("volume", info.workspaceVol))
+		}
+	}
+
+	networkRef := info.networkID
+	if networkRef == "" {
+		networkRef = info.networkName
+	}
+	if networkRef != "" {
+		if err := a.dockerClient.NetworkRemove(ctx, networkRef); err != nil {
+			a.logger.Error("Failed to remove pair network", slog.String("runner", runnerName), slog.String("network", networkRef), slog.String("error", err.Error()))
+			errs = append(errs, fmt.Sprintf("remove pair network: %v", err))
+		} else {
+			a.logger.Info("Pair network removed", slog.String("runner", runnerName), slog.String("network", networkRef))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf(strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func (a *Scaler) waitForRunnerReady(ctx context.Context, runnerContainerID, runnerName string, timeout time.Duration) error {
@@ -510,16 +574,8 @@ func (a *Scaler) shutdown(ctx context.Context) {
 
 	removeRunner := func(name string, info runnerInfo) {
 		a.logger.Info("Removing runner", slog.String("name", name), slog.String("runnerID", info.runnerID))
-		if err := a.dockerClient.ContainerRemove(ctx, info.runnerID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
-			a.logger.Error("Failed to remove runner container", slog.String("name", name), slog.String("error", err.Error()))
-		}
-		if err := a.dockerClient.ContainerRemove(ctx, info.dindID, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil {
-			a.logger.Error("Failed to remove dind container", slog.String("name", name), slog.String("error", err.Error()))
-		}
-		if err := a.dockerClient.VolumeRemove(ctx, info.workspaceVol, true); err != nil {
-			a.logger.Error("Failed to remove workspace volume", slog.String("name", name), slog.String("error", err.Error()))
-		} else {
-			a.logger.Info("Workspace volume removed", slog.String("runner", name), slog.String("volume", info.workspaceVol))
+		if err := a.removeRunnerResources(ctx, name, info); err != nil {
+			a.logger.Error("Failed to remove runner resources", slog.String("name", name), slog.String("error", err.Error()))
 		}
 	}
 
@@ -539,6 +595,8 @@ var _ listener.Scaler = (*Scaler)(nil)
 type runnerInfo struct {
 	runnerID     string
 	dindID       string
+	networkID    string
+	networkName  string
 	workspaceVol string
 }
 
