@@ -1,8 +1,8 @@
-FROM ghcr.io/actions/actions-runner:latest
+FROM ghcr.io/actions/actions-runner:2.334.0
 
 USER root
 
-COPY --from=udv-runners-nexus-proxy.ft-soft.ru/microsoft_cache/dotnet/sdk:9.0 /usr/share/dotnet /usr/share/dotnet
+COPY --from=mcr.microsoft.com/dotnet/sdk:9.0 /usr/share/dotnet /usr/share/dotnet
 ENV PATH="/usr/share/dotnet:${PATH}"
 
 RUN apt-get update \
@@ -15,18 +15,25 @@ RUN apt-get update \
         curl \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python \
-    # Node.js 20 LTS через NodeSource
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/* \
-    # pnpm через corepack (встроен в Node.js 16.9+)
-    && corepack enable \
-    && corepack prepare pnpm@latest --activate
+    && rm -rf /var/lib/apt/lists/*
 
 RUN curl -sSfL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
-# Проверка
-RUN python --version && python -c "import yaml; print('PyYAML installed successfully')"
-RUN node --version && npm --version && pnpm --version
 
+RUN python --version && python -c "import yaml; print('PyYAML installed successfully')"
+RUN node --version && npm --version
+
+# ✅ Устанавливаем pnpm глобально через npm (не через corepack)
+RUN npm install -g pnpm@10.11.0
+
+# ✅ Отключаем corepack полностью (чтобы не пытался обновлять pnpm)
+ENV COREPACK_ENABLE=0
+ENV COREPACK_ENABLE_AUTO_PIN=0
+
+# ✅ Переключаемся на пользователя runner
 USER runner
+
+# ✅ Проверяем, что pnpm работает
+RUN pnpm --version

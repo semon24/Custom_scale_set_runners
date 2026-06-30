@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -22,6 +24,8 @@ type Config struct {
 	Token           string
 	RunnerImage     string
 	DindImage       string
+	RegistryUser    string
+	RegistryPassword string
 	LogLevel        string
 	LogFormat         string
 }
@@ -35,6 +39,12 @@ func (c *Config) defaults() {
 	}
 	if c.DindImage == "" {
 		c.DindImage = "docker:dind"
+	}
+	if c.RegistryUser == "" {
+		c.RegistryUser = strings.TrimSpace(os.Getenv("REGISTRY_USER"))
+	}
+	if c.RegistryPassword == "" {
+		c.RegistryPassword = os.Getenv("REGISTRY_PASSWORD")
 	}
 }
 
@@ -151,4 +161,40 @@ func (c *Config) BuildLabels() []scaleset.Label {
 		return labels
 	}
 	return []scaleset.Label{{Name: c.ScaleSetName}}
+}
+
+func (c *Config) RegistryAuth(imageRef string) (string, error) {
+	if c.RegistryUser == "" || c.RegistryPassword == "" {
+		return "", nil
+	}
+
+	serverAddress := registryServerAddress(imageRef)
+	if serverAddress == "" {
+		return "", nil
+	}
+
+	payload, err := json.Marshal(map[string]string{
+		"username":      c.RegistryUser,
+		"password":      c.RegistryPassword,
+		"serveraddress": serverAddress,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal registry auth config: %w", err)
+	}
+
+	return base64.URLEncoding.EncodeToString(payload), nil
+}
+
+func registryServerAddress(imageRef string) string {
+	parts := strings.SplitN(imageRef, "/", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+
+	firstPart := parts[0]
+	if strings.Contains(firstPart, ".") || strings.Contains(firstPart, ":") || firstPart == "localhost" {
+		return firstPart
+	}
+
+	return ""
 }

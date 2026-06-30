@@ -133,8 +133,15 @@ func run(ctx context.Context, c Config) error {
 		"Pulling runner image",
 		slog.String("image", c.RunnerImage),
 	)
+
+	runnerRegistryAuth, err := c.RegistryAuth(c.RunnerImage)
+	if err != nil {
+		return fmt.Errorf("failed to prepare runner image registry auth: %w", err)
+	}
 	// Pull the runner image
-	pull, err := dockerClient.ImagePull(ctx, c.RunnerImage, image.PullOptions{})
+	pull, err := dockerClient.ImagePull(ctx, c.RunnerImage, image.PullOptions{
+		RegistryAuth: runnerRegistryAuth,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to pull runner image: %w", err)
 	}
@@ -148,7 +155,13 @@ func run(ctx context.Context, c Config) error {
 	}
 
 	logger.Info("Pulling dind image", slog.String("image", c.DindImage))
-	dindPull, err := dockerClient.ImagePull(ctx, c.DindImage, image.PullOptions{})
+	dindRegistryAuth, err := c.RegistryAuth(c.DindImage)
+	if err != nil {
+		return fmt.Errorf("failed to prepare dind image registry auth: %w", err)
+	}
+	dindPull, err := dockerClient.ImagePull(ctx, c.DindImage, image.PullOptions{
+		RegistryAuth: dindRegistryAuth,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to pull dind image: %w", err)
 	}

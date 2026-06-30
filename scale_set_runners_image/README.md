@@ -53,3 +53,14 @@ You'll then need:
 | `--runner-image` | No | Override container image (defaults to latest official). |
 
 *Provide either App credentials (all three) OR a PAT.*
+
+## Private registry auth
+
+If `--runner-image` points to a private registry, pass Docker registry credentials via environment variables:
+
+```bash
+REGISTRY_USER=your_login
+REGISTRY_PASSWORD=your_password
+```
+
+For Docker Compose, place them in `.env` and expose them through `environment:` for the scale set container.
