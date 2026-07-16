@@ -25,15 +25,21 @@ const volumeJanitorInterval = 3 * time.Minute
 const volumeJanitorMinAge = 10 * time.Minute
 const runnerReadyTimeout = 90 * time.Second
 
+const managedLabel = "ft-soft.runner-scale-set.managed"
+const scaleSetNameLabel = "ft-soft.runner-scale-set.name"
+const resourceTypeLabel = "ft-soft.runner-scale-set.resource"
+
 type Scaler struct {
-	countRunnersUp    int
-	justStarted       bool
-	runners           runnerState
-	janitorOnce       sync.Once
-	runnerImage       string
-	dindImage         string
-	scaleSetID        int
-	dockerClient       *dockerclient.Client
+	countRunnersUp int
+	justStarted    bool
+	runners        runnerState
+	janitorOnce    sync.Once
+	runnerImage    string
+	dindImage      string
+	scaleSetName   string
+	resourcePrefix string
+	scaleSetID     int
+	dockerClient   *dockerclient.Client
 	scalesetClient *scaleset.Client
 	minRunners     int
 	maxRunners     int
@@ -59,7 +65,6 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 			slog.Int("desiredCount", targetRunnerCount),
 			slog.Int("scaleUp", scaleUp),
 		)
-
 
 		errCh := make(chan error, scaleUp)
 		var wg sync.WaitGroup
@@ -118,6 +123,94 @@ func (a *Scaler) startVolumeJanitor(ctx context.Context) {
 			}
 		}()
 	})
+}
+
+func (a *Scaler) managedResourceLabels(resourceType string) map[string]string {
+	return map[string]string{
+		managedLabel:      "true",
+		scaleSetNameLabel: a.scaleSetName,
+		resourceTypeLabel: resourceType,
+	}
+}
+
+func (a *Scaler) hasManagedLabels(labels map[string]string) bool {
+	return labels[managedLabel] == "true" && labels[scaleSetNameLabel] == a.scaleSetName
+}
+
+func (a *Scaler) hasResourceName(name, resourceType string) bool {
+	prefix := normalizeResourcePrefix(a.scaleSetName)
+	return strings.HasPrefix(strings.TrimPrefix(name, "/"), prefix+"-"+resourceType+"-")
+}
+
+func (a *Scaler) cleanupStaleResources(ctx context.Context) error {
+	containers, err := a.dockerClient.ContainerList(ctx, container.ListOptions{
+		All: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list stale containers: %w", err)
+	}
+
+	var cleanupErrors []string
+	for _, staleContainer := range containers {
+		ownedByName := false
+		for _, name := range staleContainer.Names {
+			if a.hasResourceName(name, "runner") || a.hasResourceName(name, "dind") {
+				ownedByName = true
+				break
+			}
+		}
+		if !a.hasManagedLabels(staleContainer.Labels) && !ownedByName {
+			continue
+		}
+
+		if err := a.dockerClient.ContainerRemove(ctx, staleContainer.ID, container.RemoveOptions{
+			Force:         true,
+			RemoveVolumes: true,
+		}); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove container %s: %v", staleContainer.ID, err))
+			continue
+		}
+		a.logger.Info("Removed stale container", slog.String("containerID", staleContainer.ID))
+	}
+
+	volumes, err := a.dockerClient.VolumeList(ctx, volume.ListOptions{Filters: filters.NewArgs()})
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Sprintf("list stale volumes: %v", err))
+	} else {
+		for _, staleVolume := range volumes.Volumes {
+			if !a.hasManagedLabels(staleVolume.Labels) && !a.hasResourceName(staleVolume.Name, "workspace") {
+				continue
+			}
+			if err := a.dockerClient.VolumeRemove(ctx, staleVolume.Name, true); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove volume %s: %v", staleVolume.Name, err))
+				continue
+			}
+			a.logger.Info("Removed stale volume", slog.String("volume", staleVolume.Name))
+		}
+	}
+
+	networks, err := a.dockerClient.NetworkList(ctx, network.ListOptions{Filters: filters.NewArgs()})
+	if err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Sprintf("list stale networks: %v", err))
+	} else {
+		for _, staleNetwork := range networks {
+			if !a.hasManagedLabels(staleNetwork.Labels) && !a.hasResourceName(staleNetwork.Name, "net") {
+				continue
+			}
+			if err := a.dockerClient.NetworkRemove(ctx, staleNetwork.ID); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Sprintf("remove network %s: %v", staleNetwork.Name, err))
+				continue
+			}
+			a.logger.Info("Removed stale network", slog.String("network", staleNetwork.Name))
+		}
+	}
+
+	if len(cleanupErrors) > 0 {
+		return fmt.Errorf("stale resource cleanup failed: %s", strings.Join(cleanupErrors, "; "))
+	}
+
+	a.logger.Info("Stale runner resource cleanup completed", slog.String("scaleSetName", a.scaleSetName))
+	return nil
 }
 
 func (a *Scaler) cleanupDanglingVolumes() {
@@ -183,7 +276,7 @@ func (a *Scaler) trackedWorkspaceVolumes() map[string]struct{} {
 }
 
 func isJanitorCandidateVolume(name string) bool {
-	if strings.HasPrefix(name, "workspace-") {
+	if strings.HasPrefix(name, "workspace-") || strings.Contains(name, "-workspace-") {
 		return true
 	}
 
@@ -241,15 +334,18 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 }
 
 func (a *Scaler) startRunner(ctx context.Context) (string, error) {
-	name := fmt.Sprintf("runner-%s", uuid.NewString()[:8])
-	dindName := fmt.Sprintf("dind-%s", name)
-	networkName := fmt.Sprintf("runner-net-%s", name)
-	workspaceVolName := fmt.Sprintf("workspace-%s", name)
+	names := newRunnerResourceNames(a.resourcePrefix, uuid.NewString()[:8])
+	name := names.runner
+	dindName := names.dind
+	networkName := names.network
+	workspaceVolName := names.workspace
 	dockerHost := "tcp://docker:2375"
 
 	a.logger.Info("Starting runner with image", "image", a.runnerImage)
 
-	netResp, err := a.dockerClient.NetworkCreate(ctx, networkName, network.CreateOptions{})
+	netResp, err := a.dockerClient.NetworkCreate(ctx, networkName, network.CreateOptions{
+		Labels: a.managedResourceLabels("network"),
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create pair network: %w", err)
 	}
@@ -266,7 +362,10 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	}()
 
 	// Create shared workspace volume (runner checkout writes here; dind mounts it so container actions see files)
-	vol, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: workspaceVolName})
+	vol, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{
+		Name:   workspaceVolName,
+		Labels: a.managedResourceLabels("workspace"),
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create workspace volume: %w", err)
 	}
@@ -278,6 +377,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		ctx,
 		&container.Config{
 			Image:      a.dindImage,
+			Labels:     a.managedResourceLabels("dind"),
 			Env:        []string{"DOCKER_TLS_CERTDIR="},
 			Entrypoint: []string{"sh", "-lc"},
 			Cmd: []string{
@@ -335,6 +435,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		ctx,
 		&container.Config{
 			Image:      a.runnerImage,
+			Labels:     a.managedResourceLabels("runner"),
 			Entrypoint: []string{"/home/runner/run.sh"},
 			Healthcheck: &container.HealthConfig{
 				Test:        []string{"CMD-SHELL", "pgrep -f Runner.Listener >/dev/null 2>&1"},
@@ -386,6 +487,55 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	})
 	cleanupNeeded = false
 	return name, nil
+}
+
+type runnerResourceNames struct {
+	runner    string
+	dind      string
+	network   string
+	workspace string
+}
+
+func newRunnerResourceNames(prefix, suffix string) runnerResourceNames {
+	prefix = normalizeResourcePrefix(prefix)
+	return runnerResourceNames{
+		runner:    fmt.Sprintf("%s-runner-%s", prefix, suffix),
+		dind:      fmt.Sprintf("%s-dind-%s", prefix, suffix),
+		network:   fmt.Sprintf("%s-net-%s", prefix, suffix),
+		workspace: fmt.Sprintf("%s-workspace-%s", prefix, suffix),
+	}
+}
+
+func normalizeResourcePrefix(value string) string {
+	value = strings.TrimSpace(value)
+	var result strings.Builder
+	result.Grow(len(value))
+
+	lastWasSeparator := false
+	for _, ch := range value {
+		valid := ch >= 'a' && ch <= 'z' ||
+			ch >= 'A' && ch <= 'Z' ||
+			ch >= '0' && ch <= '9' ||
+			ch == '_' || ch == '.' || ch == '-'
+		if valid {
+			result.WriteRune(ch)
+			lastWasSeparator = false
+			continue
+		}
+		if !lastWasSeparator {
+			result.WriteByte('-')
+			lastWasSeparator = true
+		}
+	}
+
+	prefix := strings.Trim(result.String(), "._-")
+	if prefix == "" {
+		return "scale-set"
+	}
+	if len(prefix) > 48 {
+		prefix = strings.TrimRight(prefix[:48], "._-")
+	}
+	return prefix
 }
 
 func (a *Scaler) removeRunnerResources(ctx context.Context, runnerName string, info runnerInfo) error {

@@ -1,4 +1,5 @@
 #!/bin/bash
+
 MEMORY_THRESHOLD=20
 
 MEMORY_FREE=$(free | grep Mem | awk '{print $4/$2 * 100.0}' | cut -d. -f1)

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -76,35 +77,38 @@ func run(ctx context.Context, c Config) error {
 		runnerGroupID = runnerGroup.ID
 	}
 
-	// Create the runner scale set
-	scaleSet, err := scalesetClient.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
-		Name:          c.ScaleSetName,
-		RunnerGroupID: runnerGroupID,
-		Labels:        c.BuildLabels(),
-		RunnerSetting: scaleset.RunnerSetting{
-			DisableUpdate: true,
-		},
-	})
+	// Reuse the runner scale set after restarts. Create it only on the first run.
+	scaleSet, err := scalesetClient.GetRunnerScaleSet(ctx, runnerGroupID, c.ScaleSetName)
 	if err != nil {
-		return fmt.Errorf("failed to create runner scale set: %w", err)
+		return fmt.Errorf("failed to get runner scale set: %w", err)
+	}
+	if scaleSet == nil {
+		scaleSet, err = scalesetClient.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
+			Name:          c.ScaleSetName,
+			RunnerGroupID: runnerGroupID,
+			Labels:        c.BuildLabels(),
+			RunnerSetting: scaleset.RunnerSetting{
+				DisableUpdate: true,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create runner scale set: %w", err)
+		}
+		logger.Info(
+			"Created runner scale set",
+			slog.Int("scaleSetID", scaleSet.ID),
+			slog.String("scaleSetName", scaleSet.Name),
+		)
+	} else {
+		logger.Info(
+			"Reusing existing runner scale set",
+			slog.Int("scaleSetID", scaleSet.ID),
+			slog.String("scaleSetName", scaleSet.Name),
+		)
 	}
 
 	// Set the user agent for the scaleset client now that we have the scale set ID
 	scalesetClient.SetSystemInfo(systemInfo(scaleSet.ID))
-
-	defer func() {
-		logger.Info(
-			"Deleting runner scale set",
-			slog.Int("scaleSetID", scaleSet.ID),
-		)
-		if err := scalesetClient.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID); err != nil {
-			slog.Error(
-				"Failed to delete runner scale set",
-				slog.Int("scaleSetID", scaleSet.ID),
-				slog.String("error", err.Error()),
-			)
-		}
-	}()
 
 	dockerClient, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
 	if err != nil {
@@ -177,8 +181,10 @@ func run(ctx context.Context, c Config) error {
 		return fmt.Errorf("failed to create listener: %w", err)
 	}
 
+	resourcePrefix := c.ScaleSetName
+
 	scaler := &Scaler{
-		logger:             logger.WithGroup("scaler"),
+		logger: logger.WithGroup("scaler"),
 		runners: runnerState{
 			idle: make(map[string]runnerInfo),
 			busy: make(map[string]runnerInfo),
@@ -186,11 +192,17 @@ func run(ctx context.Context, c Config) error {
 		justStarted:    true,
 		runnerImage:    c.RunnerImage,
 		dindImage:      c.DindImage,
+		scaleSetName:   c.ScaleSetName,
+		resourcePrefix: normalizeResourcePrefix(resourcePrefix),
 		minRunners:     c.MinRunners,
 		maxRunners:     c.MaxRunners,
 		dockerClient:   dockerClient,
-		scalesetClient:     scalesetClient,
-		scaleSetID:         scaleSet.ID,
+		scalesetClient: scalesetClient,
+		scaleSetID:     scaleSet.ID,
+	}
+
+	if err := scaler.cleanupStaleResources(ctx); err != nil {
+		return fmt.Errorf("failed to clean up stale runner resources: %w", err)
 	}
 
 	defer scaler.shutdown(context.WithoutCancel(ctx))
@@ -210,7 +222,7 @@ var cmd = &cobra.Command{
 	Long: `This is an example CLI application that demonstrates how to scale
 runners using Docker.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 
 		if err := cfg.Validate(); err != nil {

@@ -1,0 +1,19 @@
+services:
+  scale-set-runner-backend:
+    image: registry.ft-soft.ru/devops/scale_set_runners:latest
+    container_name: Maxexam-scale-set
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      REGISTRY_USER: ${REGISTRY_USER}
+      REGISTRY_PASSWORD: ${REGISTRY_PASSWORD} 
+    command: >
+      --runner-image="registry.ft-soft.ru/devops/runner_vneocheredi_backend:latest"
+      --url="https://github.com/ft-soft/migrant-exam-flow"
+      --name="vneocheredi_runner_maxexam"
+      --labels="vneocheredi_runner_maxexam"
+      --min-runners=1
+      --max-runners=4
+      --log-level=info
+      --token=${GITHUB_TOKEN}
