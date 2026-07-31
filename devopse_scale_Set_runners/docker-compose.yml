@@ -16,6 +16,7 @@ services:
       --labels="vneocheredi_runner_backend"
       --min-runners=1
       --max-runners=4
+      --job-start-timeout=5m
       --log-level=info
       --app-client-id=${GITHUB_APP_CLIENT_ID}
       --app-installation-id=${GITHUB_APP_INSTALLATION_ID}

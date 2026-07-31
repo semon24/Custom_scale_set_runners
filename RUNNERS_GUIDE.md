@@ -297,6 +297,7 @@ services:
 | `--token` | Условно | — | PAT вместо GitHub App. Не передавайте литералом в YAML; используйте `${GITHUB_TOKEN}`. |
 | `--runner-image` | Нет | `ghcr.io/actions/actions-runner:latest` | Образ временного runner. Для этого проекта обычно используется кастомный backend-образ из Harbor. |
 | `--dind-image` | Нет | `docker:dind` | Образ отдельного Docker daemon для каждой runner-пары. Можно указать закрепленный тег или приватный mirror. |
+| `--job-start-timeout` | Нет | `5m` | Максимальное ожидание старта назначенной GitHub job. После таймаута controller диагностирует сеть и контейнеры, затем безопасно выводит из регистрации один старейший idle runner и создает замену. Busy runners не затрагиваются; без ожидающих job таймер отключен. |
 | `--log-level` | Нет | `info` | `debug`, `info`, `warn`, `error`. Неизвестное значение фактически превращается в `info`. |
 | `--log-format` | Нет | `text` | `text` или `json`. Любое другое значение полностью отключает вывод логов. |
 
@@ -410,7 +411,68 @@ docker exec <dind-container-name> docker ps -a
 
 Эти два cache-каталога переживают завершение ephemeral runner и используются несколькими job. Не храните там секреты.
 
-### 8.6. Безопасность DinD
+### 8.6. Почему `actions/checkout` необходимо выполнять в каждой job
+
+Нельзя выполнить `actions/checkout` один раз в одной job и затем обращаться к скачанному репозиторию из других job.
+
+Каждая job запускается на отдельном ephemeral runner. Для нее controller создает собственные:
+
+- runner-контейнер;
+- DinD-контейнер;
+- Docker-сеть;
+- workspace-volume.
+
+Поэтому рабочая директория одной job недоступна другим job. Если первая job выполнила `actions/checkout`, репозиторий будет скачан только в ее workspace. Параллельно запущенные или последующие job получат другие runners и пустые workspace, в которых файлов репозитория нет.
+
+После завершения job ее runner и workspace-volume удаляются. Поэтому сохранить checkout и автоматически передать его следующей job также нельзя, даже если между job настроена зависимость через `needs`.
+
+Например, следующая схема не работает:
+
+```yaml
+jobs:
+  checkout:
+    runs-on: vneocheredi_runner
+    steps:
+      - uses: actions/checkout@v4
+
+  build:
+    needs: checkout
+    runs-on: vneocheredi_runner
+    steps:
+      - run: docker build .
+```
+
+Job `build` запускается на новом runner. В ее workspace отсутствуют файлы, скачанные job `checkout`, поэтому команды могут завершаться ошибками:
+
+```text
+Dockerfile not found
+package.json not found
+project file does not exist
+no such file or directory
+```
+
+Правильный вариант — выполнять `actions/checkout` в каждой job, которой нужны исходники:
+
+```yaml
+jobs:
+  build:
+    runs-on: vneocheredi_runner
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build .
+
+  test:
+    runs-on: vneocheredi_runner
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./run-tests.sh
+```
+
+Один `actions/checkout` можно использовать для нескольких последовательных steps только внутри одной job, поскольку все steps этой job выполняются на одном runner и используют один workspace.
+
+Если между job нужно передать не весь Git-репозиторий, а результат сборки, используйте `actions/upload-artifact` и `actions/download-artifact`. Cache предназначен для зависимостей и ускорения сборки, но не должен использоваться как общая рабочая копия репозитория.
+
+### 8.7. Безопасность DinD
 
 DinD запускается с `Privileged: true`, иначе вложенный Docker daemon обычно не сможет работать. Изоляция защищает основной Docker daemon от прямого доступа workflow, но privileged DinD все равно увеличивает риск. Не запускайте недоверенные pull request jobs из forks на этих runners без отдельной оценки угроз и ограничений GitHub environments/approvals.
 
@@ -633,8 +695,24 @@ docker pull registry.ft-soft.ru/devops/runner_vneocheredi_backend:latest
 
 ```bash
 docker compose logs --tail=500 | grep -E \
-  'Created runner scale set|Reusing existing runner scale set|Scaling up|failed|error'
+  'Created runner scale set|Reusing existing runner scale set|Scaling up|assigned-job|GitHub DNS|GitHub HTTPS|network probe|recycl|failed|error'
 ```
+
+При положительном сигнале GitHub controller пишет `Received assigned-job signal`. Если job не стартовала за `--job-start-timeout` (по умолчанию пять минут), появится `Assigned job did not start before watchdog timeout`. Перед безопасной заменой одного idle runner в лог попадут:
+
+- состояние и health runner/DinD-контейнеров;
+- последние 200 строк их логов;
+- результаты DNS и HTTPS-проверок `github.com` и `api.github.com` из controller;
+- результат аналогичной проверки из runner-контейнера;
+- имя выведенного из регистрации и нового runner.
+
+Перед удалением Docker-контейнера controller сначала удаляет регистрацию выбранного idle runner в GitHub, затем оставляет короткое окно для гонки с `JobStarted` и посылает только корректный `SIGTERM`. До `SIGKILL` безопасный режим не эскалирует. Контейнер очищается только после подтвержденного выхода. Если runner успел получить `JobStarted` во время окна гонки, он переводится в `busy` и продолжает job. Если уже выведенный из регистрации контейнер не завершился за две минуты, controller может запустить replacement и продолжит наблюдать за старым контейнером; число зарегистрированных в GitHub runners при этом остается в пределах `--max-runners`.
+
+После одной замены повторный пятиминутный отсчет не запускается по старому событию автоматически. Для следующей попытки listener должен снова подтвердить положительным сигналом, что job всё ещё ожидает runner. Поэтому одиночное устаревшее событие не создает бесконечный цикл рестартов.
+
+Пустой ответ long-poll от GitHub означает только отсутствие новой информации и вообще не передается watchdog как `count=0`. Таймер изменяется лишь по начальной статистике сессии или реальному сообщению GitHub. Поэтому пустой poll не сбрасывает уже запущенный отсчет, а настоящее значение `TotalAssignedJobs=0` корректно его отключает.
+
+`GitHub DNS probe failed` указывает на DNS/сетевую проблему controller/VM. `GitHub HTTPS probe failed` при успешном DNS обычно означает сбой маршрута, proxy, TLS или firewall. Если проверки controller успешны, а `In-runner GitHub network probe completed` имеет ненулевой `exitCode`, проблема локализована в Docker-сети runner. Обычный `ping` не используется: ICMP может блокироваться независимо от HTTPS.
 
 ### DinD не становится healthy
 

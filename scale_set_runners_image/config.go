@@ -8,26 +8,28 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/actions/scaleset"
 )
 
 type Config struct {
-	RegistrationURL string
-	MaxRunners      int
-	MinRunners      int
-	ScaleSetName    string
-	Labels          []string
-	RunnerGroup     string
-	GitHubApp       scaleset.GitHubAppAuth
+	RegistrationURL         string
+	MaxRunners              int
+	MinRunners              int
+	ScaleSetName            string
+	Labels                  []string
+	RunnerGroup             string
+	GitHubApp               scaleset.GitHubAppAuth
 	GitHubAppPrivateKeyFile string
-	Token           string
-	RunnerImage     string
-	DindImage       string
-	RegistryUser    string
-	RegistryPassword string
-	LogLevel        string
-	LogFormat         string
+	Token                   string
+	RunnerImage             string
+	DindImage               string
+	RegistryUser            string
+	RegistryPassword        string
+	LogLevel                string
+	LogFormat               string
+	JobStartTimeout         time.Duration
 }
 
 func (c *Config) defaults() {
@@ -84,6 +86,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RunnerImage == "" {
 		return fmt.Errorf("runner image is required")
+	}
+	if c.JobStartTimeout <= 0 {
+		return fmt.Errorf("job start timeout must be greater than zero")
 	}
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/google/uuid"
 )
 
@@ -24,32 +25,56 @@ const runnerUID = "1001"
 const volumeJanitorInterval = 3 * time.Minute
 const volumeJanitorMinAge = 10 * time.Minute
 const runnerReadyTimeout = 90 * time.Second
+const retirementRaceGrace = 15 * time.Second
+const retirementPollInterval = 2 * time.Second
+const retirementDegradedAfter = 2 * time.Minute
 
 const managedLabel = "ft-soft.runner-scale-set.managed"
 const scaleSetNameLabel = "ft-soft.runner-scale-set.name"
 const resourceTypeLabel = "ft-soft.runner-scale-set.resource"
 
 type Scaler struct {
-	countRunnersUp int
-	justStarted    bool
-	runners        runnerState
-	janitorOnce    sync.Once
-	runnerImage    string
-	dindImage      string
-	scaleSetName   string
-	resourcePrefix string
-	scaleSetID     int
-	dockerClient   *dockerclient.Client
-	scalesetClient *scaleset.Client
-	minRunners     int
-	maxRunners     int
-	logger         *slog.Logger
+	countRunnersUp  int
+	justStarted     bool
+	runners         runnerState
+	scaleMu         sync.Mutex
+	janitorOnce     sync.Once
+	watchdogOnce    sync.Once
+	watchdogWG      sync.WaitGroup
+	watchdogCancel  context.CancelFunc
+	runnerImage     string
+	dindImage       string
+	scaleSetName    string
+	resourcePrefix  string
+	scaleSetID      int
+	dockerClient    *dockerclient.Client
+	scalesetClient  *scaleset.Client
+	minRunners      int
+	maxRunners      int
+	logger          *slog.Logger
+	jobWatchdog     *jobWatchdog
+	jobStartTimeout time.Duration
 }
 
 func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
+	a.scaleMu.Lock()
+	defer a.scaleMu.Unlock()
+
 	a.startVolumeJanitor(ctx)
+	a.startJobWatchdog(ctx)
 
 	currentCount := a.runners.count()
+	_, busyCount := a.runners.counts()
+	decision := a.jobWatchdog.update(time.Now(), count, busyCount, false)
+	if count > 0 {
+		a.logger.Info(
+			"Received assigned-job signal",
+			slog.Int("assignedJobs", count),
+			slog.Int("busyRunners", busyCount),
+			slog.Int("queuedJobs", decision.QueuedJobs),
+			slog.Duration("jobStartTimeout", a.jobStartTimeout),
+		)
+	}
 	targetRunnerCount := min(a.maxRunners, a.minRunners+count)
 
 	switch {
@@ -94,6 +119,8 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		if failed > 0 {
 			return a.runners.count(), fmt.Errorf("failed to start %d of %d runners: %w", failed, scaleUp, firstErr)
 		}
+		_, busyCount = a.runners.counts()
+		a.jobWatchdog.update(time.Now(), count, busyCount, true)
 		return a.runners.count(), nil
 	default:
 		// No need to handle scale down events, since:
@@ -103,6 +130,249 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		// 4. If the job is cancelled, the JobCompleted event will still be delivered.
 	}
 	return a.runners.count(), nil
+}
+
+func (a *Scaler) startJobWatchdog(ctx context.Context) {
+	a.watchdogOnce.Do(func() {
+		watchdogCtx, cancel := context.WithCancel(ctx)
+		a.watchdogCancel = cancel
+		checkInterval := min(10*time.Second, a.jobStartTimeout/10)
+		if checkInterval <= 0 {
+			checkInterval = time.Second
+		}
+		a.logger.Info(
+			"Starting assigned-job watchdog",
+			slog.Duration("jobStartTimeout", a.jobStartTimeout),
+			slog.Duration("checkInterval", checkInterval),
+		)
+
+		a.watchdogWG.Add(1)
+		go func() {
+			defer a.watchdogWG.Done()
+			ticker := time.NewTicker(checkInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-watchdogCtx.Done():
+					a.logger.Info("Assigned-job watchdog stopped")
+					return
+				case now := <-ticker.C:
+					decision := a.jobWatchdog.check(now)
+					if !decision.Recover {
+						continue
+					}
+					a.recoverStaleIdleRunner(watchdogCtx, decision)
+				}
+			}
+		}()
+	})
+}
+
+func (a *Scaler) stopJobWatchdog() {
+	if a.watchdogCancel != nil {
+		a.watchdogCancel()
+	}
+	a.watchdogWG.Wait()
+}
+
+func (a *Scaler) recoverStaleIdleRunner(parentCtx context.Context, decision watchdogDecision) {
+	recoveryStartedAt := time.Now()
+	defer func() {
+		a.jobWatchdog.finishRecovery()
+	}()
+
+	a.logger.Warn(
+		"Assigned job did not start before watchdog timeout",
+		slog.Int("queuedJobs", decision.QueuedJobs),
+		slog.Duration("waitingFor", decision.WaitingFor),
+		slog.Duration("jobStartTimeout", a.jobStartTimeout),
+	)
+
+	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Minute)
+	defer cancel()
+
+	name, info, ok := a.runners.oldestIdle()
+	if ok {
+		a.logRunnerDiagnostics(ctx, name, info)
+	} else {
+		a.logger.Warn("Watchdog found no idle runner to diagnose; busy runners will not be touched")
+	}
+	a.logGitHubConnectivity(ctx)
+
+	a.scaleMu.Lock()
+	defer a.scaleMu.Unlock()
+
+	if !a.jobWatchdog.recoveryStillDue(time.Now(), decision.Generation) {
+		a.logger.Info("Watchdog recovery cancelled because runner pool made progress")
+		return
+	}
+
+	info, ok = a.runners.beginRetirement(name)
+	if !ok {
+		a.logger.Info("Watchdog recovery cancelled because the diagnosed runner is no longer idle", slog.String("runner", name))
+		return
+	}
+	if info.registrationID == 0 {
+		a.runners.restoreRetirement(name)
+		a.logger.Error("Cannot safely retire runner without a GitHub registration ID", slog.String("runner", name))
+		return
+	}
+
+	a.logger.Warn(
+		"Deregistering oldest idle runner before replacement",
+		slog.String("runner", name),
+		slog.String("runnerContainerID", info.runnerID),
+		slog.Int64("runnerRegistrationID", info.registrationID),
+		slog.Time("runnerCreatedAt", info.createdAt),
+	)
+	if err := a.scalesetClient.RemoveRunner(ctx, info.registrationID); err != nil {
+		a.runners.restoreRetirement(name)
+		a.logger.Error(
+			"Failed to deregister stale runner; container was left untouched",
+			slog.String("runner", name),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+
+	replacementStarted := false
+	if a.jobWatchdog.hasQueuedJobs() && a.runners.count() < a.maxRunners {
+		replacementName, err := a.startRunner(ctx)
+		if err != nil {
+			a.logger.Error(
+				"Failed to create replacement runner",
+				slog.String("retiringRunner", name),
+				slog.String("error", err.Error()),
+			)
+		} else {
+			replacementStarted = true
+			a.logger.Info(
+				"Safe replacement runner started",
+				slog.String("retiringRunner", name),
+				slog.String("replacementRunner", replacementName),
+			)
+		}
+	}
+
+	a.startRetirementReaper(parentCtx, name, info, !replacementStarted)
+	a.logger.Info(
+		"Safe idle runner retirement initiated",
+		slog.String("retiringRunner", name),
+		slog.Bool("replacementStarted", replacementStarted),
+		slog.Duration("recoveryDuration", time.Since(recoveryStartedAt)),
+	)
+}
+
+func (a *Scaler) startRetirementReaper(ctx context.Context, runnerName string, info runnerInfo, startReplacementOnExit bool) {
+	a.watchdogWG.Add(1)
+	go func() {
+		defer a.watchdogWG.Done()
+
+		// Leave a short window for a racing JobStarted event. markBusy moves a
+		// retiring runner back to busy, in which case it must never be signalled.
+		grace := time.NewTimer(retirementRaceGrace)
+		defer grace.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-grace.C:
+		}
+		if !a.runners.isRetiring(runnerName) {
+			a.logger.Info("Retirement cancelled because runner accepted a job", slog.String("runner", runnerName))
+			return
+		}
+
+		// The official runner entrypoint traps TERM when this runner environment
+		// variable is enabled. We never escalate to SIGKILL in safe mode.
+		if err := a.dockerClient.ContainerKill(ctx, info.runnerID, "SIGTERM"); err != nil {
+			a.logger.Warn("Failed to send graceful termination signal to retired runner; continuing to supervise it", slog.String("runner", runnerName), slog.String("error", err.Error()))
+		} else {
+			a.logger.Info("Sent graceful termination signal to retired runner", slog.String("runner", runnerName), slog.String("signal", "SIGTERM"))
+		}
+
+		startedAt := time.Now()
+		ticker := time.NewTicker(retirementPollInterval)
+		defer ticker.Stop()
+		replacementStarted := !startReplacementOnExit
+		degradedLogged := false
+		lastInspectWarning := time.Time{}
+
+		for {
+			if !a.runners.isRetiring(runnerName) {
+				a.logger.Info("Retirement cleanup skipped because runner accepted a job", slog.String("runner", runnerName))
+				return
+			}
+
+			inspect, err := a.dockerClient.ContainerInspect(ctx, info.runnerID)
+			if err != nil {
+				if errdefs.IsNotFound(err) {
+					a.logger.Info("Retired runner container no longer exists", slog.String("runner", runnerName))
+					break
+				}
+				if lastInspectWarning.IsZero() || time.Since(lastInspectWarning) >= 30*time.Second {
+					a.logger.Warn("Failed to inspect retired runner; will retry", slog.String("runner", runnerName), slog.String("error", err.Error()))
+					lastInspectWarning = time.Now()
+				}
+			} else if inspect.State != nil && !inspect.State.Running {
+				a.logger.Info("Retired runner container exited", slog.String("runner", runnerName), slog.Int("exitCode", inspect.State.ExitCode))
+				break
+			}
+
+			if !replacementStarted && time.Since(startedAt) >= retirementDegradedAfter && a.jobWatchdog.hasQueuedJobs() {
+				// The old runner is already deregistered, so this keeps GitHub's
+				// registered runner count within maxRunners. Docker may temporarily
+				// contain one extra, gracefully shutting-down container.
+				a.scaleMu.Lock()
+				if a.jobWatchdog.hasQueuedJobs() && a.runners.registeredCount() < a.maxRunners {
+					replacementName, startErr := a.startRunner(ctx)
+					if startErr != nil {
+						a.logger.Error("Failed to start degraded replacement while retired runner is shutting down", slog.String("retiringRunner", runnerName), slog.String("error", startErr.Error()))
+					} else {
+						replacementStarted = true
+						a.logger.Warn("Started replacement while deregistered runner is still shutting down", slog.String("retiringRunner", runnerName), slog.String("replacementRunner", replacementName))
+					}
+				}
+				a.scaleMu.Unlock()
+				if !degradedLogged {
+					a.logger.Warn("Retired runner did not exit after graceful signal", slog.String("runner", runnerName), slog.Duration("waitingFor", time.Since(startedAt)))
+					degradedLogged = true
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+
+		retiredInfo, ok := a.runners.finishRetirement(runnerName)
+		if !ok {
+			a.logger.Info("Retirement cleanup skipped because runner accepted a job", slog.String("runner", runnerName))
+			return
+		}
+
+		cleanupCtx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		if err := a.removeRunnerResources(cleanupCtx, runnerName, retiredInfo); err != nil {
+			a.logger.Error("Failed to clean up exited retired runner", slog.String("runner", runnerName), slog.String("error", err.Error()))
+		}
+
+		if replacementStarted || !a.jobWatchdog.hasQueuedJobs() {
+			return
+		}
+		a.scaleMu.Lock()
+		defer a.scaleMu.Unlock()
+		if !a.jobWatchdog.hasQueuedJobs() || a.runners.count() >= a.maxRunners {
+			return
+		}
+		replacementName, err := a.startRunner(ctx)
+		if err != nil {
+			a.logger.Error("Failed to create replacement after retired runner exited", slog.String("retiredRunner", runnerName), slog.String("error", err.Error()))
+			return
+		}
+		a.logger.Info("Replacement runner started after safe retirement", slog.String("retiredRunner", runnerName), slog.String("replacementRunner", replacementName))
+	}()
 }
 
 func (a *Scaler) startVolumeJanitor(ctx context.Context) {
@@ -272,6 +542,12 @@ func (a *Scaler) trackedWorkspaceVolumes() map[string]struct{} {
 		}
 	}
 
+	for _, info := range a.runners.retiring {
+		if info.workspaceVol != "" {
+			volumes[info.workspaceVol] = struct{}{}
+		}
+	}
+
 	return volumes
 }
 
@@ -322,14 +598,36 @@ func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 		slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
 		slog.String("jobId", jobInfo.JobID),
 	)
-	a.runners.markBusy(jobInfo.RunnerName)
+	knownRunner := a.runners.markBusy(jobInfo.RunnerName)
+	if !knownRunner {
+		a.logger.Warn(
+			"Received job-start event before runner became tracked",
+			slog.String("runner", jobInfo.RunnerName),
+			slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
+			slog.String("jobId", jobInfo.JobID),
+		)
+	}
+	_, busyCount := a.runners.counts()
+	if !knownRunner {
+		busyCount++
+	}
+	a.jobWatchdog.jobStarted(time.Now(), busyCount)
 	return nil
 }
 
 func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
-	info := a.runners.markDone(jobInfo.RunnerName)
+	info, ok := a.runners.markDone(jobInfo.RunnerName)
+	if !ok {
+		a.logger.Warn(
+			"Received job-completed event for an unknown or recycled runner",
+			slog.String("runner", jobInfo.RunnerName),
+			slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
+			slog.String("jobId", jobInfo.JobID),
+		)
+		return nil
+	}
 	return a.removeRunnerResources(ctx, jobInfo.RunnerName, info)
 }
 
@@ -356,7 +654,14 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		if !cleanupNeeded {
 			return
 		}
-		if err := a.removeRunnerResources(context.WithoutCancel(ctx), name, cleanup); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+		defer cancel()
+		if cleanup.registrationID != 0 {
+			if err := a.scalesetClient.RemoveRunner(cleanupCtx, cleanup.registrationID); err != nil {
+				a.logger.Error("Failed to rollback runner registration", slog.String("runner", name), slog.Int64("runnerRegistrationID", cleanup.registrationID), slog.String("error", err.Error()))
+			}
+		}
+		if err := a.removeRunnerResources(cleanupCtx, name, cleanup); err != nil {
 			a.logger.Error("Failed to rollback runner resources", slog.String("runner", name), slog.String("error", err.Error()))
 		}
 	}()
@@ -430,6 +735,10 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to generate JIT config: %w", err)
 	}
+	if jit.Runner == nil || jit.Runner.ID == 0 {
+		return "", fmt.Errorf("generated JIT config has no runner registration ID")
+	}
+	cleanup.registrationID = int64(jit.Runner.ID)
 
 	c, err := a.dockerClient.ContainerCreate(
 		ctx,
@@ -447,6 +756,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 			Env: []string{
 				fmt.Sprintf("ACTIONS_RUNNER_INPUT_JITCONFIG=%s", jit.EncodedJITConfig),
 				fmt.Sprintf("DOCKER_HOST=%s", dockerHost),
+				"RUNNER_MANUALLY_TRAP_SIG=1",
 			},
 		},
 		&container.HostConfig{
@@ -478,13 +788,18 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("runner did not become ready: %w", err)
 	}
 
-	a.runners.addIdle(name, runnerInfo{
-		runnerID:     c.ID,
-		dindID:       dindC.ID,
-		networkID:    netResp.ID,
-		networkName:  networkName,
-		workspaceVol: vol.Name,
+	completedBeforeTracking := a.runners.addIdle(name, runnerInfo{
+		runnerID:       c.ID,
+		dindID:         dindC.ID,
+		networkID:      netResp.ID,
+		networkName:    networkName,
+		workspaceVol:   vol.Name,
+		registrationID: int64(jit.Runner.ID),
+		createdAt:      time.Now(),
 	})
+	if completedBeforeTracking {
+		return "", fmt.Errorf("runner completed before it became ready for tracking")
+	}
 	cleanupNeeded = false
 	return name, nil
 }
@@ -576,7 +891,7 @@ func (a *Scaler) removeRunnerResources(ctx context.Context, runnerName string, i
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf(strings.Join(errs, "; "))
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -738,64 +1053,188 @@ func (a *Scaler) shutdown(ctx context.Context) {
 		removeRunner(name, info)
 	}
 	clear(a.runners.busy)
+
+	for name, info := range a.runners.retiring {
+		removeRunner(name, info)
+	}
+	clear(a.runners.retiring)
 }
 
 var _ listener.Scaler = (*Scaler)(nil)
 
 type runnerInfo struct {
-	runnerID     string
-	dindID       string
-	networkID    string
-	networkName  string
-	workspaceVol string
+	runnerID       string
+	dindID         string
+	networkID      string
+	networkName    string
+	workspaceVol   string
+	registrationID int64
+	createdAt      time.Time
 }
 
 type runnerState struct {
-	mu   sync.Mutex
-	idle map[string]runnerInfo
-	busy map[string]runnerInfo
+	mu          sync.Mutex
+	idle        map[string]runnerInfo
+	busy        map[string]runnerInfo
+	retiring    map[string]runnerInfo
+	pendingBusy map[string]struct{}
+	pendingDone map[string]struct{}
 }
 
 func (r *runnerState) count() int {
 	r.mu.Lock()
-	count := len(r.idle) + len(r.busy)
+	count := len(r.idle) + len(r.busy) + len(r.retiring)
 	r.mu.Unlock()
 	return count
 }
 
-func (r *runnerState) markBusy(name string) {
+func (r *runnerState) counts() (idle, busy int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.idle), len(r.busy)
+}
+
+func (r *runnerState) registeredCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.idle) + len(r.busy)
+}
+
+func (r *runnerState) isRetiring(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.retiring[name]
+	return ok
+}
+
+func (r *runnerState) oldestIdle() (string, runnerInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.oldestIdleUnlocked()
+}
+
+func (r *runnerState) oldestIdleUnlocked() (string, runnerInfo, bool) {
+	var oldestName string
+	var oldestInfo runnerInfo
+	for name, info := range r.idle {
+		if oldestName == "" || info.createdAt.Before(oldestInfo.createdAt) {
+			oldestName = name
+			oldestInfo = info
+		}
+	}
+	if oldestName == "" {
+		return "", runnerInfo{}, false
+	}
+	return oldestName, oldestInfo, true
+}
+
+func (r *runnerState) markBusy(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	info, ok := r.idle[name]
 	if !ok {
-		panic("marking non-existent runner busy")
+		info, ok = r.retiring[name]
+		if !ok {
+			if _, completed := r.pendingDone[name]; completed {
+				return false
+			}
+			if r.pendingBusy == nil {
+				r.pendingBusy = make(map[string]struct{})
+			}
+			r.pendingBusy[name] = struct{}{}
+			return false
+		}
+		delete(r.retiring, name)
+	} else {
+		delete(r.idle, name)
 	}
-	delete(r.idle, name)
 	r.busy[name] = info
+	return true
 }
 
-func (r *runnerState) markDone(name string) runnerInfo {
+func (r *runnerState) markDone(name string) (runnerInfo, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.markDoneUnlocked(name)
 }
 
-func (r *runnerState) markDoneUnlocked(name string) runnerInfo {
+func (r *runnerState) markDoneUnlocked(name string) (runnerInfo, bool) {
 	info, ok := r.busy[name]
 	if ok {
 		delete(r.busy, name)
-		return info
+		return info, true
 	}
 	info, ok = r.idle[name]
 	if ok {
 		delete(r.idle, name)
-		return info
+		return info, true
 	}
-	panic("marking non-existent runner done")
+	info, ok = r.retiring[name]
+	if ok {
+		delete(r.retiring, name)
+		return info, true
+	}
+	if _, startedBeforeTracking := r.pendingBusy[name]; startedBeforeTracking {
+		delete(r.pendingBusy, name)
+		if r.pendingDone == nil {
+			r.pendingDone = make(map[string]struct{})
+		}
+		r.pendingDone[name] = struct{}{}
+	}
+	return runnerInfo{}, false
 }
 
-func (r *runnerState) addIdle(name string, info runnerInfo) {
+// addIdle returns true when start and completion events both arrived before
+// the runner finished its readiness checks. The caller must clean it up rather
+// than resurrecting the completed ephemeral runner as idle.
+func (r *runnerState) addIdle(name string, info runnerInfo) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, alreadyDone := r.pendingDone[name]; alreadyDone {
+		delete(r.pendingDone, name)
+		return true
+	}
+	if _, alreadyBusy := r.pendingBusy[name]; alreadyBusy {
+		delete(r.pendingBusy, name)
+		r.busy[name] = info
+	} else {
+		r.idle[name] = info
+	}
+	return false
+}
+
+func (r *runnerState) beginRetirement(name string) (runnerInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	info, ok := r.idle[name]
+	if !ok {
+		return runnerInfo{}, false
+	}
+	delete(r.idle, name)
+	r.retiring[name] = info
+	return info, true
+}
+
+func (r *runnerState) restoreRetirement(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	info, ok := r.retiring[name]
+	if !ok {
+		return false
+	}
+	delete(r.retiring, name)
 	r.idle[name] = info
-	r.mu.Unlock()
+	return true
+}
+
+func (r *runnerState) finishRetirement(name string) (runnerInfo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	info, ok := r.retiring[name]
+	if !ok {
+		return runnerInfo{}, false
+	}
+	delete(r.retiring, name)
+	return info, true
 }

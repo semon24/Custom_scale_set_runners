@@ -9,9 +9,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/actions/scaleset"
-	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
@@ -35,6 +35,7 @@ func init() {
 	flags.StringVar(&cfg.LogFormat, "log-format", "text", "Logging format (text, json). If invalid value is provided, defaults to no logs.")
 	flags.StringVar(&cfg.RunnerImage, "runner-image", "", "Docker image for GitHub Actions runner")
 	flags.StringVar(&cfg.DindImage, "dind-image", "docker:dind", "Docker-in-Docker image for runner isolation")
+	flags.DurationVar(&cfg.JobStartTimeout, "job-start-timeout", 5*time.Minute, "How long an assigned job may wait before one idle runner is replaced")
 	if err := cmd.MarkFlagRequired("url"); err != nil {
 		panic(err)
 	}
@@ -171,34 +172,29 @@ func run(ctx context.Context, c Config) error {
 	}
 	defer sessionClient.Close(context.Background())
 
-	logger.Info("Initializing listener")
-	listener, err := listener.New(sessionClient, listener.Config{
-		ScaleSetID: scaleSet.ID,
-		MaxRunners: c.MaxRunners,
-		Logger:     logger.WithGroup("listener"),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create listener: %w", err)
-	}
-
 	resourcePrefix := c.ScaleSetName
 
 	scaler := &Scaler{
 		logger: logger.WithGroup("scaler"),
 		runners: runnerState{
-			idle: make(map[string]runnerInfo),
-			busy: make(map[string]runnerInfo),
+			idle:        make(map[string]runnerInfo),
+			busy:        make(map[string]runnerInfo),
+			retiring:    make(map[string]runnerInfo),
+			pendingBusy: make(map[string]struct{}),
+			pendingDone: make(map[string]struct{}),
 		},
-		justStarted:    true,
-		runnerImage:    c.RunnerImage,
-		dindImage:      c.DindImage,
-		scaleSetName:   c.ScaleSetName,
-		resourcePrefix: normalizeResourcePrefix(resourcePrefix),
-		minRunners:     c.MinRunners,
-		maxRunners:     c.MaxRunners,
-		dockerClient:   dockerClient,
-		scalesetClient: scalesetClient,
-		scaleSetID:     scaleSet.ID,
+		justStarted:     true,
+		runnerImage:     c.RunnerImage,
+		dindImage:       c.DindImage,
+		scaleSetName:    c.ScaleSetName,
+		resourcePrefix:  normalizeResourcePrefix(resourcePrefix),
+		minRunners:      c.MinRunners,
+		maxRunners:      c.MaxRunners,
+		dockerClient:    dockerClient,
+		scalesetClient:  scalesetClient,
+		scaleSetID:      scaleSet.ID,
+		jobStartTimeout: c.JobStartTimeout,
+		jobWatchdog:     newJobWatchdog(c.JobStartTimeout),
 	}
 
 	if err := scaler.cleanupStaleResources(ctx); err != nil {
@@ -208,8 +204,10 @@ func run(ctx context.Context, c Config) error {
 	defer scaler.shutdown(context.WithoutCancel(ctx))
 
 	logger.Info("Starting listener")
-	if err := listener.Run(ctx, scaler); !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("listener run failed: %w", err)
+	listenerErr := runScaleSetListener(ctx, sessionClient, c.MaxRunners, scaler, logger.WithGroup("listener"))
+	scaler.stopJobWatchdog()
+	if listenerErr != nil && !errors.Is(listenerErr, context.Canceled) {
+		return fmt.Errorf("listener run failed: %w", listenerErr)
 	}
 	return nil
 }

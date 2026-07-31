@@ -15,5 +15,6 @@ services:
       --labels="vneocheredi_runner_maxexam"
       --min-runners=1
       --max-runners=4
+      --job-start-timeout=5m
       --log-level=info
       --token=${GITHUB_TOKEN}
